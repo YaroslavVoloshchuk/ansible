@@ -1,0 +1,244 @@
+---
+- hosts: localhost
+  connection: local
+  gather_facts: yes
+  vars:
+  - vpc_region: us-east-1
+  - my_useast1_key: aws_access
+
+  tasks:
+  - name: create VPC for Ansible
+    ec2_vpc_net:
+      name: ansibleVPC
+      state: present
+      cidr_block: 172.32.0.0/16
+      region: "{{ vpc_region }}"
+    register: ansibleVPC
+
+  - name: display ansibleVPC results
+    debug: var=ansibleVPC
+
+  - name: create internet gateway for ansibleVPC
+    ec2_vpc_igw:
+      state: present
+      region: "{{ vpc_region }}"
+      vpc_id: "{{ ansibleVPC.vpc.id }}"
+      tags:
+        Name: ansibleVPC_IGW
+    register: ansibleVPC_igw
+
+  - name: display ansibleVPC IGW details
+    debug: var=ansibleVPC_igw
+
+  - name: obtain all AZ present in region {{ vpc_region }}
+    aws_az_facts:
+      region: "{{ vpc_region }}"
+    register: az_in_region
+
+  - name: display all AZ present in region {{ vpc_region }}
+    debug: var=az_in_region
+
+  #create public subnet in first az and private subnet in second az
+  - name: display AZ that will be used for public and private Subnets
+    debug:
+      msg:
+        - "public subnet in AZ: {{ az_in_region.availability_zones[0].zone_name }}"
+        - "private subnet in AZ: {{ az_in_region.availability_zones[1].zone_name }}"
+
+  - name: create public subnet in AZ {{ az_in_region.availability_zones[0].zone_name }}
+    ec2_vpc_subnet:
+      state: present
+      cidr: 172.32.1.0/24
+      az: "{{ az_in_region.availability_zones[0].zone_name }}"
+      vpc_id: "{{ ansibleVPC.vpc.id }}"
+      region: "{{ vpc_region }}"
+      map_public: yes
+      tags:
+        Name: public subnet
+    register: public_subnet
+
+  - name: show public subnet details
+    debug: var=public_subnet
+
+  - name: create private subnet in AZ {{ az_in_region.availability_zones[1].zone_name }}
+    ec2_vpc_subnet:
+      state: present
+      cidr: 172.32.2.0/24
+      az: "{{ az_in_region.availability_zones[1].zone_name }}"
+      vpc_id: "{{ ansibleVPC.vpc.id }}"
+      region: "{{ vpc_region }}"
+      resource_tags:
+        Name: private subnet
+    register: private_subnet
+
+  - name: show private subnet details
+    debug:  var=private_subnet
+
+  - name: create new route table for public subnet
+    ec2_vpc_route_table:
+      state: present
+      region: "{{ vpc_region }}"
+      vpc_id: "{{ ansibleVPC.vpc.id }}"
+      tags:
+        Name: rt_ansibleVPC_PublicSubnet
+      subnets:
+        - "{{ public_subnet.subnet.id }}"
+      routes:
+        - dest: 0.0.0.0/0
+          gateway_id: "{{ ansibleVPC_igw.gateway_id }}"
+    register: rt_ansibleVPC_PublicSubnet
+
+  - name: display public route table
+    debug: var=rt_ansibleVPC_PublicSubnet
+
+  - name: create a security group for bastion
+    ec2_group:
+      state: present
+      name: sg_ansibleVPC_publicsubnet_bastion
+      description: security group for bastion within the public subnet of ansible VPC
+      vpc_id: "{{ ansibleVPC.vpc.id }}"
+      region: "{{ vpc_region }}"
+      rules:
+        - proto: tcp
+          ports:
+            - 22
+          cidr_ip: 0.0.0.0/0
+          rule_desc: allow ssh to bastion
+    register: sg_ansibleVPC_publicsubnet_bastion
+
+  - name: display details for bastion security group
+    debug: var=sg_ansibleVPC_publicsubnet_bastion
+
+  - name: deploy ubuntu bastion
+    ec2:
+      key_name: "{{ my_useast1_key }}"
+      instance_type: t2.micro
+      image: ami-09e67e426f25ce0d7
+      group_id: "{{ sg_ansibleVPC_publicsubnet_bastion.group_id }}"
+      vpc_subnet_id: "{{ public_subnet.subnet.id }}"
+      assign_public_ip: yes
+      region: "{{ vpc_region }}"
+      instance_tags:
+        Name: ubuntubastion
+      count_tag:
+        Name: ubuntubastion
+      exact_count: 1
+    register: ubuntubastion
+
+  - name: display details for ubuntu bastion
+    debug: var=ubuntubastion
+
+  - name: create a security group for servers in private subnet with only tcp 22, 8080 incoming
+    ec2_group:
+      state: present
+      name: sg_ansibleVPC_privatesubnet_servers
+      description: security group for private subnet that allows limited access from public subnet
+      vpc_id: "{{ ansibleVPC.vpc.id }}"
+      region: "{{ vpc_region }}"
+      rules:
+        - proto: tcp
+          ports:
+           - 22
+           - 80
+           - 8080
+          group_name: sg_ansibleVPC_publicsubnet_bastion
+    register: sg_ansibleVPC_privatesubnet_servers
+
+  - name: display details for private subnet security group
+    debug: var=sg_ansibleVPC_privatesubnet_servers
+
+  - name: deploy a ubuntu 20.04 in private subnet
+    ec2:
+      key_name: "{{ my_useast1_key }}"
+      instance_type: t2.micro
+      image: ami-09e67e426f25ce0d7
+      group_id: "{{ sg_ansibleVPC_privatesubnet_servers.group_id }}"
+      vpc_subnet_id: "{{ private_subnet.subnet.id }}"
+      assign_public_ip: no
+      region: "{{ vpc_region }}"
+      instance_tags:
+        Name: ubuntu
+      count_tag:
+        Name: ubuntu
+      exact_count: 2
+    register: ubuntu
+
+  - name: display details for ubuntu 20.04 in private subnet
+    debug: var=ubuntu
+
+  - name: Create NAT Gateway
+    ec2_vpc_nat_gateway:
+      state:                  'present'
+      subnet_id:              "{{ public_subnet.subnet.id }}"
+      wait:                   yes
+      if_exist_do_not_create: true
+      release_eip:            true
+    register: nat_gateway
+
+  - name: Set Nat Gateway ID in variable
+    set_fact:
+      nat_gateway_id: "{{ nat_gateway.nat_gateway_id }}"
+
+  - name: Set up private subnet route table
+    ec2_vpc_route_table:
+      vpc_id:           "{{ ansibleVPC.vpc.id }}"
+      region:           "{{ vpc_region }}"
+      subnets:          "{{ private_subnet.subnet.id }}"
+      routes:
+        - dest:         '0.0.0.0/0'
+          gateway_id:   "{{ nat_gateway_id }}"
+    register: private_route
+
+  - name: create a security group for ALB
+    ec2_group:
+       state: present
+       name: sg_ansibleVPC_alb
+       description: security group for alb
+       vpc_id: "{{ ansibleVPC.vpc.id }}"
+       region: "{{ vpc_region }}"
+       rules:
+         - proto: tcp
+           ports:
+            - 80
+            - 8080
+           cidr_ip: 0.0.0.0/0
+           rule_desc: allow ports fot alb
+    register: sg_ansibleVPC_alb
+
+  - name: display details for ALB security group
+    debug: var=sg_ansibleVPC_alb
+
+  - name: create target group
+    elb_target_group:
+            name: targetgroup-alb
+            state: present
+            protocol: http
+            port: 80
+            vpc_id: "{{ ansibleVPC.vpc.id }}"
+            health_check_protocol: http
+            health_check_path: /
+            successful_response_codes: "200,250-260"
+            targets:
+               - Id: i-01f138f0f8e293319
+                 Port: 80
+               - Id: i-024fa92a3e18d4f2a
+                 Port: 80
+            wait_timeout: 200
+    register: app_tg
+
+  - name: Create the application load balancer
+    elb_application_lb:
+       name: absible-load-balancer
+       state: present
+       security_groups:
+         - "{{ sg_ansibleVPC_alb.group_id }}"
+       subnets:
+         - "{{ public_subnet.subnet.id }}"
+         - "{{ private_subnet.subnet.id }}"
+       listeners:
+         - Protocol: HTTP
+           Port: 80
+           DefaultActions:
+            - Type: forward
+              TargetGroupArn: "{{app_tg.target_group_arn }}"
+    register: alb
