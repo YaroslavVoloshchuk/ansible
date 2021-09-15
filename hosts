@@ -1,0 +1,14 @@
+[local]
+localhost
+
+[bastion]
+3.239.46.129
+
+[webservers:vars]
+#ansible_ssh_user=ubuntu
+#ansible_ssh_common_args='-o StrictHostKeyChecking=no'
+#ansible_ssh_common_args='-o ProxyCommand="ssh -W %h:%p -q ubuntu@3.222.192.201 -i /home/bamik/.ssh/aws_access.pem"'
+
+[webservers]
+172.32.2.248
+172.32.2.35
